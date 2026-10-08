@@ -1,39 +1,46 @@
 #!/usr/bin/python3
 # ================================================================
 # LYNX_CHECK_Motors.py
-# Pulse each motor in each direction. Watch and confirm.
-#
-# Sequence:
-#   1. Left forward   (1 second)
-#   2. Left backward  (1 second)
-#   3. Right forward  (1 second)
-#   4. Right backward (1 second)
-#
-# Press Enter between each test to confirm it moved correctly.
-# Records a pass/fail truth table at the end.
+# Pulse each channel in each direction. Rover on blocks.
+# Watch all four wheels, write down what you saw, then press Enter
+# to see what the encoders saw.
 # ================================================================
+
+PIT_PWM_MAX = 80             # pit-mode cap
+PWM_TEST    = 50
+PULSE       = 1.0            # s
+N           = 12000          # ticks per wheel turn
 
 import serial
 import time
-import sys
-
 from lynx_port import get_port
-ser = serial.Serial(port=get_port(), baudrate=115200, timeout=0.05)
 
+ser = serial.Serial(port=get_port(), baudrate=115200, timeout=0.05)
 time.sleep(2)
 ser.readline()
 
-PWM_TEST = 50
-PULSE    = 1.0
-
 def send_motor(channel, u):
-    pwm = min(int(abs(u)), 127)
+    pwm = min(int(abs(u)), PIT_PWM_MAX)
     sel = (1 if u >= 0 else 2) if channel == 1 else (3 if u >= 0 else 4)
     ser.write(bytes([sel, pwm]))
 
 def stop_all():
     ser.write(bytes([1, 0]))
     ser.write(bytes([3, 0]))
+
+def read_pair(sel):
+    ser.reset_input_buffer()
+    ser.write(bytes([sel]))
+    try:
+        a, b = ser.readline().decode().strip().split()
+        return int(a), int(b)
+    except (ValueError, UnicodeDecodeError):
+        return None, None
+
+def read_all():
+    fl, rl = read_pair(5)
+    fr, rr = read_pair(6)
+    return None if fl is None or fr is None else (fl, rl, fr, rr)
 
 tests = [
     ("Left Forward",   1,  PWM_TEST),
@@ -42,48 +49,30 @@ tests = [
     ("Right Backward", 2, -PWM_TEST),
 ]
 
-results = []
-
-print("=" * 55)
-print("  MOTOR CHECK — Watch each motor pulse")
-print(f"  PWM: {PWM_TEST}  Pulse: {PULSE}s")
-print("=" * 55)
-
 try:
     for name, ch, pwm in tests:
-        input(f"\n  Ready to test: {name}. Press Enter...")
-        print(f"  Pulsing {name}...", end="", flush=True)
-
+        input(f"\n  {name}. Hands clear, press Enter...")
+        c0 = read_all()
         send_motor(ch, pwm)
         time.sleep(PULSE)
         stop_all()
-        time.sleep(0.3)
+        time.sleep(0.4)
+        c1 = read_all()
 
-        ok = input("  Correct? (y/n): ").strip().lower()
-        results.append((name, "PASS" if ok == 'y' else "FAIL"))
+        input("  Write down what each wheel did, then press Enter...")
+        if c0 is None or c1 is None:
+            print("  encoders: no reply")
+        else:
+            d = [(b - a) / N for a, b in zip(c0, c1)]
+            print(f"  turns:  FL {d[0]:+.3f}  RL {d[1]:+.3f}  "
+                  f"FR {d[2]:+.3f}  RR {d[3]:+.3f}")
 
-except KeyboardInterrupt:
+except (KeyboardInterrupt, EOFError):
     print("\n\nInterrupted.")
-    stop_all()
 
 finally:
     stop_all()
     time.sleep(0.1)
     ser.write(bytes([7]))
     ser.close()
-
-# ── Truth table ──────────────────────────────────────────────
-print("\n" + "=" * 55)
-print("  MOTOR CHECK RESULTS")
-print("  " + "-" * 35)
-for name, status in results:
-    mark = "OK" if status == "PASS" else "XX"
-    print(f"  [{mark}]  {name}")
-print("=" * 55)
-
-all_pass = all(s == "PASS" for _, s in results)
-if all_pass:
-    print("  All motors verified.")
-else:
-    print("  Some motors FAILED — check wiring or Sabertooth config.")
-print("=^..^=")
+    print("=^..^=")
