@@ -71,7 +71,7 @@ fault   = {"msg": ""}
 running = True
 t0      = time.monotonic()
 logf    = open(time.strftime("pit_log_%Y%m%d_%H%M%S.csv"), "w", buffering=1)
-logf.write("t,uL,uR,phiL,phiR\n")
+logf.write("t_s,uL_pwm,uR_pwm,phiL_rad,phiR_rad\n")
 
 # ── Control loop, 20 Hz: the only code that talks to the Mega ──
 def run_loop():
