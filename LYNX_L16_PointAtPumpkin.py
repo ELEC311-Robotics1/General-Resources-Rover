@@ -26,6 +26,7 @@ CAM_W    = 640               # camera image size asked for, px
 CAM_H    = 480
 JPEG_Q   = 60                # stream quality, 0-100 (smaller: faster)
 STALE    = 0.5               # s without a frame -> motors stop
+STREAM_FPS = 10              # pictures per second sent to each phone
 
 import logging
 import os
@@ -203,7 +204,9 @@ def frames():
         if jpg and n != last:              # send each new picture once
             last = n
             yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-        time.sleep(0.02)
+            time.sleep(1 / STREAM_FPS)     # spare the Wi-Fi
+        else:
+            time.sleep(0.02)
 
 @app.route("/video")
 def video():

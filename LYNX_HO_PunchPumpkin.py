@@ -26,6 +26,7 @@ STEP    = 10                 # keyboard PWM change per press
 TURN    = 0.6                # share of PWM_MAX used for turning
 QUIET   = 0.3                # s without a joystick message -> stop
 STALE   = 0.5                # s without a camera frame -> stop
+STREAM_FPS = 10              # pictures per second sent to each phone
 MIN_AREA = 300               # px^2; smaller orange blobs are ignored
 LO = (10, 120, 80)           # HSV limits: orange
 HI = (25, 255, 255)
@@ -295,7 +296,9 @@ def frames():
         if jpg and n != last:              # send each new picture once
             last = n
             yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-        time.sleep(0.02)
+            time.sleep(1 / STREAM_FPS)     # spare the Wi-Fi
+        else:
+            time.sleep(0.02)
 
 @app.route("/video")
 def video():
