@@ -11,6 +11,7 @@
 #
 # Keys, in this terminal:
 #     m       motors on / off (they start off)
+#     + / -   turning PWM up / down by 10
 #     space   motors off                  q   quit
 # The motors stop on q, Ctrl+C, a closed SSH session, a lost USB link,
 # and when the camera sends no frame for STALE seconds.
@@ -19,8 +20,11 @@
 LO       = (10, 120, 80)     # HSV limits: orange
 HI       = (25, 255, 255)
 MIN_AREA = 300               # px^2; smaller blobs are ignored
-PWM      = 40                # turning PWM, both sides
+PWM      = 60                # turning PWM at start; + / - change it
 CAM      = 0                 # camera number
+CAM_W    = 640               # camera image size asked for, px
+CAM_H    = 480
+JPEG_Q   = 60                # stream quality, 0-100 (smaller: faster)
 STALE    = 0.5               # s without a frame -> motors stop
 
 import logging
@@ -71,33 +75,58 @@ def find(img):
     th = 0.5 * np.arctan2(2 * m["mu11"], m["mu20"] - m["mu02"])
     return cx, cy, th
 
-def steer(cx, w):
+def steer(cx, w, pwm):
     """Bands: (uL, uR) from the centroid column cx and image width w."""
     if cx is None:
         return 0, 0
     if cx < w / 3:
-        return -PWM, +PWM          # left band: turn left
+        return -pwm, +pwm          # left band: turn left
     if cx > 2 * w / 3:
-        return +PWM, -PWM          # right band: turn right
+        return +pwm, -pwm          # right band: turn right
     return 0, 0                    # middle band: stop
 
 # ── Shared state ────────────────────────────────────────────────
 lock    = threading.Lock()
-seen    = {"cx": None, "w": 640, "t": 0.0, "jpg": None}
-cmd     = {"on": False, "uL": 0, "uR": 0, "fresh": False}
+latest  = {"img": None, "n": 0}                    # newest camera frame
+seen    = {"cx": None, "w": 640, "t": 0.0, "jpg": None, "n": 0, "fps": 0.0}
+cmd     = {"on": False, "uL": 0, "uR": 0, "fresh": False, "pwm": PWM}
 fault   = {"msg": ""}
 running = True
 
-# ── Camera thread: grab, find, draw, encode ─────────────────────
-def camera():
+# ── Grabber thread: read the camera nonstop, keep only the newest ──
+# The camera driver queues frames. If they are not read as fast as they
+# arrive, the program works on old ones: the picture lags and the steering
+# reacts late. Reading nonstop here means the vision always gets the newest.
+def open_camera():
     cam = cv2.VideoCapture(CAM)
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cam
+
+def grabber():
+    cam = open_camera()
     while running:
         ok, img = cam.read()
         if not ok:                         # camera unplugged or busy
             cam.release()
             time.sleep(1.0)
-            cam = cv2.VideoCapture(CAM)
+            cam = open_camera()
             continue
+        with lock:
+            latest.update(img=img, n=latest["n"] + 1)
+    cam.release()
+
+# ── Vision thread: newest frame -> find, draw, encode ───────────
+def camera():
+    last, t_fps, count, fps = 0, time.monotonic(), 0, 0.0
+    while running:
+        with lock:
+            img, n = latest["img"], latest["n"]
+        if img is None or n == last:       # nothing new yet
+            time.sleep(0.005)
+            continue
+        last = n
         h, w = img.shape[:2]
         found = find(img)
         for x in (w // 3, 2 * w // 3):     # band edges
@@ -108,25 +137,29 @@ def camera():
             cv2.line(img, (int(cx - dx), int(cy - dy)),
                      (int(cx + dx), int(cy + dy)), (255, 0, 255), 2)
             cv2.circle(img, (int(cx), int(cy)), 6, (0, 0, 255), -1)
+        count += 1
+        if time.monotonic() - t_fps >= 1.0:
+            fps, count, t_fps = count / (time.monotonic() - t_fps), 0, time.monotonic()
         with lock:
-            on, uL, uR = cmd["on"], cmd["uL"], cmd["uR"]
+            on, uL, uR, pwm = cmd["on"], cmd["uL"], cmd["uR"], cmd["pwm"]
         text = fault["msg"] or (f"motors {'ON ' if on else 'OFF'}"
-                                f"  L {uL:+d}  R {uR:+d}")
+                                f"  L {uL:+d}  R {uR:+d}  turn {pwm}")
         cv2.putText(img, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (0, 255, 255), 2)
-        ok, jpg = cv2.imencode(".jpg", img)
+        cv2.putText(img, f"{w}x{h}  {fps:.0f} fps", (10, h - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_Q])
         with lock:
-            seen.update(cx=found[0] if found else None, w=w,
+            seen.update(cx=found[0] if found else None, w=w, n=n, fps=fps,
                         t=time.monotonic(), jpg=jpg.tobytes())
-    cam.release()
 
 # ── Control loop, 20 Hz: the only code that talks to the Mega ──
 def run_loop():
     while running:
         with lock:
             fresh = time.monotonic() - seen["t"] < STALE
-            cx, w, on = seen["cx"], seen["w"], cmd["on"]
-        uL, uR = steer(cx, w) if (on and fresh) else (0, 0)
+            cx, w, on, pwm = seen["cx"], seen["w"], cmd["on"], cmd["pwm"]
+        uL, uR = steer(cx, w, pwm) if (on and fresh) else (0, 0)
         send_motor(1, uL)
         send_motor(2, uR)
         with lock:
@@ -154,7 +187,7 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style> body { background:#08080f; color:#d8dce8; font-family:sans-serif; margin:16px; }
         img { max-width:100%; } </style></head><body>
-<p>Keys in the SSH terminal: m motors on/off, space off, q quit.</p>
+<p>Keys in the SSH terminal: m motors on/off, + / - turning PWM, space off, q quit.</p>
 <img src="/video">
 </body></html>"""
 
@@ -163,12 +196,14 @@ def index():
     return PAGE
 
 def frames():
+    last = 0
     while running:
         with lock:
-            jpg = seen["jpg"]
-        if jpg:
+            jpg, n = seen["jpg"], seen["n"]
+        if jpg and n != last:              # send each new picture once
+            last = n
             yield b"--f\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-        time.sleep(0.1)
+        time.sleep(0.02)
 
 @app.route("/video")
 def video():
@@ -185,17 +220,22 @@ def handle_key(ch):
             cmd["on"] = False
         elif ch == "m" and not fault["msg"]:
             cmd["on"] = not cmd["on"]
+        elif ch in "+=":
+            cmd["pwm"] = min(120, cmd["pwm"] + 10)
+        elif ch == "-":
+            cmd["pwm"] = max(20, cmd["pwm"] - 10)
     return True
 
 def status():
     with lock:
         on, uL, uR, fresh = cmd["on"], cmd["uL"], cmd["uR"], cmd["fresh"]
-        cx = seen["cx"]
+        cx, fps, pwm = seen["cx"], seen["fps"], cmd["pwm"]
     where = "-" if cx is None else f"{cx:4.0f}"
     cam = "" if fresh else "NO CAMERA"
     msg = fault["msg"] or cam
-    print(f"\r  motors {'ON ' if on else 'OFF'}   L {uL:+4d}   R {uR:+4d}"
-          f"   cx {where:>4s}   {msg:30s}", end="", flush=True)
+    print(f"\r  motors {'ON ' if on else 'OFF'}  turn {pwm:3d}   L {uL:+4d}"
+          f"   R {uR:+4d}   cx {where:>4s}   {fps:3.0f} fps   {msg:12s}",
+          end="", flush=True)
 
 # ── Run, and always stop the motors on the way out ─────────────
 def shutdown(*_):
@@ -207,12 +247,13 @@ signal.signal(signal.SIGHUP, shutdown)            # SSH session closed
 if __name__ == "__main__":
     server = make_server("0.0.0.0", 5000, app, threaded=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=grabber, daemon=True).start()
     threading.Thread(target=camera, daemon=True).start()
     worker = threading.Thread(target=loop, daemon=True)
     worker.start()
 
     print("  Camera: http://<rover address>:5000")
-    print("  m motors on/off   space off   q quit\n")
+    print("  m motors on/off   + / - turning PWM   space off   q quit\n")
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
