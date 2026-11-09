@@ -4,16 +4,18 @@
 # The rover drives itself: it chases an orange target with the camera
 # (visual servoing), keeps its pose from the encoders (dead reckoning),
 # and drives back to where it started (home).  ON THE FLOOR, clear space.
-# Run on the rover's Pi, from your team folder, with YOUR calibration:
-#     python3 General-Resources-Rover/LYNX_HO_W10_Aut.py r L k PWM0 A
-#         r     wheel radius (mm)           from the straight run
-#         L     track width (mm)            from the circles
-#         k     motor slope (rad/s per PWM) from the circles
-#         PWM0  deadband (PWM)              from the circles
-#         A     goal area A* (px^2)         from the area run
+# Run on the rover's Pi, from your team folder, with YOUR k:
+#     python3 General-Resources-Rover/LYNX_HO_W10_Aut.py k PWM0
+#     python3 General-Resources-Rover/LYNX_HO_W10_Aut.py k PWM0 Hl Sl Vl Hh Sh Vh
+#         k       motor slope (rad/s per PWM), from the calibration
+#         PWM0    deadband (PWM), from the calibration
+#         Hl...Vh HSV limits LO and HI from W9_hsv_tuner.py (optional;
+#                 orange if left out)
 # then open  http://<rover address>:5000  on a phone or laptop.
 #
 # Keys, in this terminal:
+#     t       goal size A* = the size seen now (hold the target where
+#             the rover should stop, then press t). Needed before c.
 #     c       chase the target (camera)
 #     h       go home to (0, 0) (encoders only)
 #     z       pose = (0, 0, 0) here
@@ -24,17 +26,20 @@
 # Log: aut_log_<time>.csv in the folder you ran it from.
 # ================================================================
 
-LO       = (10, 120, 80)     # HSV limits: orange
+R_EFF    = 60.325            # mm, wheel radius (Lynxmotion: 120.65 mm wheel)
+L_EFF    = 287.0             # mm, track width (Lynxmotion)
+LO       = (10, 120, 80)     # HSV limits: orange (command line changes them)
 HI       = (25, 255, 255)
 MIN_AREA = 300               # px^2; smaller blobs are ignored
-DEAD_A   = 0.05              # dead zone: this share of A* counts as 0
-KV       = 0.05              # chase: mm/s per px^2 of area error
+DEAD_A   = 0.10              # dead zone on (A* - A) / A*: no chatter
+DEAD_X   = 20                # px: pixel errors smaller than this count as 0
+KV       = 200.0             # chase: mm/s when the target is far
 KW       = 0.004             # chase: rad/s per pixel of error
 V_MAX    = 250.0             # mm/s, fastest forward or back
 KD       = 1.0               # home: mm/s per mm of distance
 KTH      = 1.5               # home: rad/s per rad of heading error
 HOME_TOL = 50.0              # mm: closer than this is home
-PWM_MAX  = 110               # cap on every command (Sabertooth max 127)
+PWM_MAX  = 70                # cap on every command (Sabertooth max 127)
 N        = 12000             # ticks per wheel turn
 CAM      = 0                 # camera number
 CAM_W    = 640               # camera image size asked for, px
@@ -64,9 +69,13 @@ from lynx_port import get_port
 
 # ── Your calibration, from the command line ────────────────────
 try:
-    R_EFF, L_EFF, K_MOT, PWM0, A_GOAL = map(float, sys.argv[1:6])
-except ValueError:
-    print("  usage: LYNX_HO_W10_Aut.py r L k PWM0 A   (your numbers)")
+    K_MOT, PWM0 = float(sys.argv[1]), float(sys.argv[2])
+    if len(sys.argv) >= 9:
+        hsv = [int(a) for a in sys.argv[3:9]]
+        LO, HI = tuple(hsv[:3]), tuple(hsv[3:])
+    assert K_MOT > 0 and PWM0 >= 0
+except (ValueError, IndexError, AssertionError):
+    print("  usage: LYNX_HO_W10_Aut.py k PWM0 [Hl Sl Vl Hh Sh Vh]")
     sys.exit(1)
 J = np.array([[R_EFF / 2, R_EFF / 2],       # (v, w) = J (wL, wR)
               [-R_EFF / L_EFF, R_EFF / L_EFF]])
@@ -81,7 +90,7 @@ def wheels_pwm(v, w):
 
 # ── Desk check: before any motor turns ─────────────────────────
 def desk_check():
-    tests = [((0, 0),   lambda L, R: L == 0 and R == 0, "stop"),
+    tests = [((0, 0),   lambda L, R: abs(L) + abs(R) < 1e-6, "stop"),
              ((100, 0), lambda L, R: abs(L - R) < 1e-6 and L > 0,
               "straight"),
              ((0, 0.5), lambda L, R: R > 0 > L,         "turn left")]
@@ -95,11 +104,13 @@ def desk_check():
     return ok
 
 # ── Chase: Lecture 18, from the image to v and w ───────────────
-def chase(u, A, kw):
+def chase(u, A, a_goal, kw):
     ex = CAM_W / 2 - u                      # pixel error, + left
-    e = A_GOAL - A                          # area error, + too far
-    if abs(e) < DEAD_A * A_GOAL:
+    e = (a_goal - A) / a_goal               # area error, + too far
+    if abs(e) < DEAD_A:
         e = 0.0                             # dead zone: no chatter
+    if abs(ex) < DEAD_X:
+        ex = 0.0                            # centred enough: no hum
     v = max(-V_MAX, min(V_MAX, KV * e))     # mm/s
     w = kw * ex                             # rad/s
     return v, w
@@ -155,7 +166,7 @@ lock    = threading.Lock()
 latest  = {"img": None, "n": 0}
 seen    = {"cx": None, "area": 0.0, "t": 0.0, "jpg": None, "n": 0,
            "fps": 0.0}
-cmd     = {"mode": "", "uL": 0, "uR": 0, "kw": KW,
+cmd     = {"mode": "", "uL": 0, "uR": 0, "kw": KW, "a_goal": None,
            "zero": False}
 pose    = {"x": 0.0, "y": 0.0, "th": 0.0, "d": 0.0}
 fault   = {"msg": ""}
@@ -242,13 +253,13 @@ def run_loop():
                 pose["th"] += R_EFF * (dR - dL) / L_EFF
             prev = (phiL, phiR)
             x, y, th = pose["x"], pose["y"], pose["th"]
-            mode, kw = cmd["mode"], cmd["kw"]
+            mode, kw, a_goal = cmd["mode"], cmd["kw"], cmd["a_goal"]
             cx, area = seen["cx"], seen["area"]
             fresh = time.monotonic() - seen["t"] < STALE
 
         v = w = 0.0
-        if mode == "chase" and fresh and cx is not None:
-            v, w = chase(cx, area, kw)
+        if mode == "chase" and fresh and cx is not None and a_goal:
+            v, w = chase(cx, area, a_goal, kw)
         elif mode == "home":
             v, w, d = home(x, y, th)
             if d < HOME_TOL:
@@ -288,7 +299,7 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style> body { background:#08080f; color:#d8dce8; font-family:sans-serif; margin:16px; }
         img { max-width:100%; } </style></head><body>
-<p>Keys in the SSH terminal: c chase, h home, z zero pose, + / - turn gain, space stop, q quit.</p>
+<p>Keys in the SSH terminal: t goal size, c chase, h home, z zero pose, + / - turn gain, space stop, q quit.</p>
 <img src="/video">
 </body></html>"""
 
@@ -321,7 +332,9 @@ def handle_key(ch):
     with lock:
         if ch == " ":
             cmd["mode"] = ""
-        elif ch == "c" and not fault["msg"]:
+        elif ch == "t" and seen["cx"] is not None:
+            cmd["a_goal"] = seen["area"]
+        elif ch == "c" and not fault["msg"] and cmd["a_goal"]:
             cmd["mode"] = "chase"
         elif ch == "h" and not fault["msg"]:
             cmd["mode"] = "home"
@@ -337,13 +350,16 @@ def status():
     with lock:
         m, uL, uR, kw = cmd["mode"], cmd["uL"], cmd["uR"], cmd["kw"]
         x, y, th = pose["x"], pose["y"], pose["th"]
-        cx, fps = seen["cx"], seen["fps"]
+        cx, fps, area = seen["cx"], seen["fps"], seen["area"]
+        a_goal = cmd["a_goal"]
     where = "-" if cx is None else f"{cx:4.0f}"
+    size = "-" if cx is None else f"{area:6.0f}"
+    goal = "press t" if not a_goal else f"{a_goal:6.0f}"
     msg = fault["msg"]
     print(f"\r  {m or 'stop':5s}  L {uL:+4d} R {uR:+4d}  "
           f"x {x:6.0f} y {y:6.0f} th {math.degrees(th):5.0f}  "
-          f"cx {where:>4s}  KW {kw:.4f}  {fps:3.0f} fps  {msg:12s}",
-          end="", flush=True)
+          f"cx {where:>4s}  A {size} / {goal}  KW {kw:.4f}  "
+          f"{fps:3.0f} fps  {msg:12s}", end="", flush=True)
 
 # ── Run, and always stop the motors on the way out ─────────────
 def shutdown(*_):
@@ -353,8 +369,8 @@ signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGHUP, shutdown)            # SSH session closed
 
 if __name__ == "__main__":
-    print(f"  Calibration: r {R_EFF} mm, L {L_EFF} mm, "
-          f"k {K_MOT} rad/s per PWM, PWM0 {PWM0}, A* {A_GOAL} px^2")
+    print(f"  r {R_EFF} mm, L {L_EFF} mm, k {K_MOT} rad/s per PWM, "
+          f"PWM0 {PWM0}, HSV LO {LO} HI {HI}, top PWM {PWM_MAX}")
     if not desk_check():
         print("  wheels_pwm is not right yet: fix it, then run again.")
         stop_all()
@@ -368,7 +384,7 @@ if __name__ == "__main__":
     worker.start()
 
     print("  Camera: http://<rover address>:5000")
-    print("  c chase  h home  z zero  + / - KW  space stop  q quit\n")
+    print("  t goal size  c chase  h home  z zero  + / - KW  space  q\n")
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
